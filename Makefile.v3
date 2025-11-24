@@ -1,0 +1,175 @@
+# Makefile for ClickHouse Zero-Copy LD_PRELOAD Library v3 (BPF Bypass)
+
+CC = gcc
+CLANG = clang
+CFLAGS = -Wall -Wextra -O3 -fPIC -std=gnu11
+BPF_CFLAGS = -O2 -target bpf -g
+LDFLAGS = -shared -ldl -pthread -luring -lelf -lz
+TARGET = libclickhouse_zerocopy_v3.so
+SOURCE = clickhouse_zerocopy_v3.c
+BPF_PROG = bpf_xdp_zerocopy.c
+BPF_OBJ = bpf_xdp_zerocopy.o
+
+.PHONY: all clean test install compare check bpf
+
+all: $(TARGET)
+
+# Build main library
+$(TARGET): $(SOURCE)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+
+# Build BPF programs
+bpf: $(BPF_OBJ)
+
+$(BPF_OBJ): $(BPF_PROG)
+	@if command -v $(CLANG) > /dev/null 2>&1; then \
+		echo "Building BPF program..."; \
+		$(CLANG) $(BPF_CFLAGS) -c $< -o $@; \
+	else \
+		echo "Warning: clang not found, skipping BPF compilation"; \
+	fi
+
+clean:
+	rm -f $(TARGET) $(BPF_OBJ) test_zerocopy_v3 bench_bypass *.o
+
+# Build test program
+test: test_zerocopy_v3
+	@echo "Run: sudo LD_PRELOAD=./$(TARGET) ZEROCOPY_DEBUG=1 ./test_zerocopy_v3"
+	@echo "Note: May require root for DMA buffer allocation"
+
+test_zerocopy_v3: test_zerocopy_v3.c $(TARGET)
+	$(CC) -Wall -O2 -o $@ test_zerocopy_v3.c -L. -lclickhouse_zerocopy_v3 -luring -Wl,-rpath,.
+
+# Build benchmark
+bench: bench_bypass
+	@echo "Benchmark DMA and bypass performance"
+
+bench_bypass: bench_bypass.c $(TARGET)
+	$(CC) -Wall -O2 -o $@ bench_bypass.c -lpthread
+
+# Compare all versions
+compare: bench_bypass
+	@echo "=== Comparing v1, v2, and v3 ==="
+	@echo ""
+	@echo "=== Baseline (no LD_PRELOAD) ==="
+	@./bench_bypass 2>/dev/null || echo "Build bench_bypass first"
+	@echo ""
+	@echo "=== v1: splice/sendfile ==="
+	@LD_PRELOAD=./libclickhouse_zerocopy.so ./bench_bypass 2>/dev/null || echo "v1 not built"
+	@echo ""
+	@echo "=== v2: io_uring ==="
+	@LD_PRELOAD=./libclickhouse_zerocopy_v2.so ./bench_bypass 2>/dev/null || echo "v2 not built"
+	@echo ""
+	@echo "=== v3: BPF bypass + DMA ==="
+	@LD_PRELOAD=./$(TARGET) ZEROCOPY_BYPASS_MODE=full ./bench_bypass 2>/dev/null || echo "v3 not built"
+
+# Install to system (requires root)
+install: $(TARGET)
+	install -m 755 $(TARGET) /usr/local/lib/
+	@if [ -f $(BPF_OBJ) ]; then \
+		install -m 644 $(BPF_OBJ) /usr/local/lib/bpf/; \
+	fi
+	ldconfig
+
+# Uninstall from system
+uninstall:
+	rm -f /usr/local/lib/$(TARGET)
+	rm -f /usr/local/lib/bpf/$(BPF_OBJ)
+	ldconfig
+
+# Show size
+size: $(TARGET)
+	@ls -lh $(TARGET)
+	@size $(TARGET)
+
+# Check requirements
+check:
+	@echo "Checking requirements for v3..."
+	@echo ""
+	@echo "1. Kernel version:"
+	@uname -r
+	@echo ""
+	@echo "2. liburing:"
+	@pkg-config --exists liburing && echo "  ✓ liburing found" || echo "  ✗ liburing not found"
+	@echo ""
+	@echo "3. Huge pages:"
+	@if [ -d /sys/kernel/mm/hugepages ]; then \
+		echo "  ✓ Hugepages supported"; \
+		cat /proc/meminfo | grep -i huge || true; \
+	else \
+		echo "  ✗ Hugepages not available"; \
+	fi
+	@echo ""
+	@echo "4. io_uring:"
+	@if [ -f /proc/sys/kernel/io_uring_disabled ]; then \
+		if [ "$$(cat /proc/sys/kernel/io_uring_disabled)" = "0" ]; then \
+			echo "  ✓ io_uring enabled"; \
+		else \
+			echo "  ✗ io_uring disabled"; \
+		fi \
+	else \
+		echo "  ? Cannot check io_uring status"; \
+	fi
+	@echo ""
+	@echo "5. BPF support:"
+	@if [ -d /sys/fs/bpf ]; then \
+		echo "  ✓ BPF filesystem mounted"; \
+	else \
+		echo "  ⚠ BPF filesystem not mounted"; \
+	fi
+	@echo ""
+	@echo "6. Permissions:"
+	@if [ "$$(id -u)" = "0" ]; then \
+		echo "  ✓ Running as root"; \
+	else \
+		echo "  ⚠ Not running as root (may need for DMA)"; \
+	fi
+	@echo ""
+	@echo "7. Memory limits:"
+	@ulimit -l | grep -q unlimited && echo "  ✓ Unlimited locked memory" || echo "  ⚠ Limited locked memory: $$(ulimit -l) KB"
+
+# Setup system for optimal performance
+setup:
+	@echo "Setting up system for v3 bypass mode..."
+	@echo "Note: Requires root privileges"
+	@echo ""
+	@echo "1. Enabling huge pages..."
+	@sudo sysctl -w vm.nr_hugepages=512 || true
+	@echo ""
+	@echo "2. Increasing locked memory limits..."
+	@sudo sh -c 'echo "* soft memlock unlimited" >> /etc/security/limits.conf' || true
+	@sudo sh -c 'echo "* hard memlock unlimited" >> /etc/security/limits.conf' || true
+	@echo ""
+	@echo "3. Enabling io_uring..."
+	@sudo sysctl -w kernel.io_uring_disabled=0 || true
+	@echo ""
+	@echo "4. Mounting BPF filesystem..."
+	@sudo mount -t bpf bpf /sys/fs/bpf 2>/dev/null || echo "  (already mounted or not available)"
+	@echo ""
+	@echo "Setup complete! Reboot may be required for some changes."
+
+# Help
+help:
+	@echo "ClickHouse Zero-Copy v3 (BPF Bypass Edition)"
+	@echo ""
+	@echo "Targets:"
+	@echo "  make              - Build the library"
+	@echo "  make bpf          - Build BPF programs"
+	@echo "  make test         - Build test program"
+	@echo "  make bench        - Build benchmark"
+	@echo "  make compare      - Compare all versions"
+	@echo "  make check        - Check system requirements"
+	@echo "  make setup        - Setup system for optimal performance"
+	@echo "  make install      - Install system-wide (requires root)"
+	@echo "  make clean        - Clean build artifacts"
+	@echo ""
+	@echo "Environment Variables:"
+	@echo "  ZEROCOPY_DEBUG=1              - Enable debug output"
+	@echo "  ZEROCOPY_THRESHOLD=N          - Min bytes for bypass (default: 16384)"
+	@echo "  ZEROCOPY_BYPASS_MODE=full     - Bypass mode: full, partial, kernel"
+	@echo "  ZEROCOPY_DIRECT_IO=1          - Enable O_DIRECT bypass"
+	@echo "  ZEROCOPY_NIC_QUEUE=N          - NIC queue count"
+	@echo ""
+	@echo "Example Usage:"
+	@echo "  sudo LD_PRELOAD=./libclickhouse_zerocopy_v3.so clickhouse-server"
+	@echo "  ZEROCOPY_BYPASS_MODE=full ./run_clickhouse_zerocopy_v3.sh clickhouse-server"

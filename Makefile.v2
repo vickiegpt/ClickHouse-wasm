@@ -1,0 +1,64 @@
+# Makefile for ClickHouse Zero-Copy LD_PRELOAD Library v2 (io_uring)
+
+CC = gcc
+CFLAGS = -Wall -Wextra -O3 -fPIC -std=gnu11
+LDFLAGS = -shared -ldl -pthread -luring
+TARGET = libclickhouse_zerocopy_v2.so
+SOURCE = clickhouse_zerocopy_v2.c
+
+.PHONY: all clean test install compare
+
+all: $(TARGET)
+
+$(TARGET): $(SOURCE)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+
+clean:
+	rm -f $(TARGET) test_zerocopy_v2 bench_compare *.o
+
+# Build test program
+test: test_zerocopy_v2
+	@echo "Run: LD_PRELOAD=./$(TARGET) ZEROCOPY_DEBUG=1 ./test_zerocopy_v2"
+
+test_zerocopy_v2: test_zerocopy_v2.c $(TARGET)
+	$(CC) -Wall -O2 -o $@ test_zerocopy_v2.c -L. -lclickhouse_zerocopy_v2 -luring -Wl,-rpath,.
+
+# Build benchmark comparison
+bench: bench_compare
+	@echo "Comparing v1 (splice/sendfile) vs v2 (io_uring)"
+
+bench_compare: bench_compare.c libclickhouse_zerocopy.so $(TARGET)
+	$(CC) -Wall -O2 -o $@ bench_compare.c -lpthread
+
+# Compare both versions
+compare: bench_compare
+	@echo "=== Benchmark: No LD_PRELOAD ==="
+	@./bench_compare
+	@echo ""
+	@echo "=== Benchmark: v1 (splice/sendfile) ==="
+	@LD_PRELOAD=./libclickhouse_zerocopy.so ./bench_compare
+	@echo ""
+	@echo "=== Benchmark: v2 (io_uring) ==="
+	@LD_PRELOAD=./$(TARGET) ./bench_compare
+
+# Install to system (requires root)
+install: $(TARGET)
+	install -m 755 $(TARGET) /usr/local/lib/
+	ldconfig
+
+# Uninstall from system (requires root)
+uninstall:
+	rm -f /usr/local/lib/$(TARGET)
+	ldconfig
+
+# Show size
+size: $(TARGET)
+	@ls -lh $(TARGET)
+	@size $(TARGET)
+
+# Check liburing availability
+check:
+	@echo "Checking for liburing..."
+	@pkg-config --exists liburing && echo "✓ liburing found" || echo "✗ liburing not found"
+	@echo "Checking kernel io_uring support..."
+	@test -d /sys/kernel/btf && echo "✓ Kernel supports io_uring" || echo "⚠ Cannot verify kernel support"
