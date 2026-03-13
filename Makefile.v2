@@ -2,19 +2,20 @@
 
 CC = gcc
 CFLAGS = -Wall -Wextra -O3 -fPIC -std=gnu11
-LDFLAGS = -shared -ldl -pthread -luring
+LDFLAGS = -shared
+LDLIBS = -ldl -pthread -luring
 TARGET = libclickhouse_zerocopy_v2.so
 SOURCE = clickhouse_zerocopy_v2.c
 
-.PHONY: all clean test install compare
+.PHONY: all clean test install compare synthetic_hft hft-compare
 
 all: $(TARGET)
 
 $(TARGET): $(SOURCE)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
 clean:
-	rm -f $(TARGET) test_zerocopy_v2 bench_compare *.o
+	rm -f $(TARGET) test_zerocopy_v2 bench_compare synthetic_hft *.o
 
 # Build test program
 test: test_zerocopy_v2
@@ -40,6 +41,16 @@ compare: bench_compare
 	@echo ""
 	@echo "=== Benchmark: v2 (io_uring) ==="
 	@LD_PRELOAD=./$(TARGET) ./bench_compare
+
+synthetic_hft: synthetic_hft.c
+	$(CC) -Wall -O2 -o $@ synthetic_hft.c -lpthread -lm
+
+hft-compare: synthetic_hft $(TARGET)
+	@echo "=== Synthetic HFT: baseline ==="
+	@./synthetic_hft
+	@echo ""
+	@echo "=== Synthetic HFT: zerocopy v2 ==="
+	@ZEROCOPY_THRESHOLD=1 LD_PRELOAD=./$(TARGET) ./synthetic_hft
 
 # Install to system (requires root)
 install: $(TARGET)

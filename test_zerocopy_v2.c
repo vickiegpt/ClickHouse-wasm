@@ -12,6 +12,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
+#include <sys/syscall.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/wait.h>
@@ -34,6 +36,64 @@ static double get_time_ms(void)
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
+static ssize_t raw_write_all(int fd, const void *buf, size_t len)
+{
+    const char *ptr = buf;
+    size_t written = 0;
+
+    while (written < len) {
+        ssize_t n = syscall(SYS_write, fd, ptr + written, len - written);
+        if (n <= 0)
+            return n;
+        written += (size_t)n;
+    }
+
+    return (ssize_t)written;
+}
+
+static int create_tcp_pair(int fds[2])
+{
+    int listener = -1;
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+
+    listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0)
+        return -1;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+
+    if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+        goto fail;
+    if (listen(listener, 1) < 0)
+        goto fail;
+    if (getsockname(listener, (struct sockaddr *)&addr, &addrlen) < 0)
+        goto fail;
+
+    fds[0] = socket(AF_INET, SOCK_STREAM, 0);
+    if (fds[0] < 0)
+        goto fail;
+    if (connect(fds[0], (struct sockaddr *)&addr, sizeof(addr)) < 0)
+        goto fail_client;
+
+    fds[1] = accept(listener, NULL, NULL);
+    if (fds[1] < 0)
+        goto fail_client;
+
+    close(listener);
+    return 0;
+
+fail_client:
+    close(fds[0]);
+    fds[0] = -1;
+fail:
+    close(listener);
+    return -1;
+}
+
 void create_test_file(void)
 {
     printf("Creating test file: %s (%d MB)...\n", TEST_FILE, TEST_SIZE / (1024*1024));
@@ -48,7 +108,7 @@ void create_test_file(void)
     memset(buf, 'A', sizeof(buf));
 
     for (size_t i = 0; i < TEST_SIZE / sizeof(buf); i++) {
-        if (write(fd, buf, sizeof(buf)) != sizeof(buf)) {
+        if (raw_write_all(fd, buf, sizeof(buf)) != sizeof(buf)) {
             perror("write");
             exit(1);
         }
@@ -61,6 +121,7 @@ void create_test_file(void)
 void test_large_send_recv(void)
 {
     printf("\n=== Test 1: Large send/recv via io_uring ===\n");
+    fflush(NULL);
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
@@ -95,7 +156,8 @@ void test_large_send_recv(void)
 
         free(buf);
         close(sv[1]);
-        exit(0);
+        fflush(stdout);
+        _exit(0);
     }
 
     /* Parent: send data */
@@ -132,10 +194,11 @@ void test_large_send_recv(void)
 void test_file_to_socket(void)
 {
     printf("\n=== Test 2: File to socket via io_uring ===\n");
+    fflush(stdout);
 
-    int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
-        perror("socketpair");
+    int sv[2] = {-1, -1};
+    if (create_tcp_pair(sv) < 0) {
+        perror("create_tcp_pair");
         return;
     }
 
@@ -170,7 +233,8 @@ void test_file_to_socket(void)
                total, elapsed, throughput);
 
         close(sv[1]);
-        exit(0);
+        fflush(stdout);
+        _exit(0);
     }
 
     /* Parent: send file via zerocopy_uring_sendfile */
@@ -187,7 +251,7 @@ void test_file_to_socket(void)
         printf("Parent sent: %zd bytes in %.2f ms (%.2f MB/s) via io_uring\n",
                sent, elapsed, throughput);
     } else {
-        printf("io_uring sendfile not available, skipping\n");
+        perror("zerocopy_uring_sendfile");
     }
 
     close(sv[0]);
@@ -198,6 +262,7 @@ void test_file_to_socket(void)
 void test_multiple_small_ops(void)
 {
     printf("\n=== Test 3: Multiple small operations (should use regular syscalls) ===\n");
+    fflush(NULL);
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
@@ -221,7 +286,8 @@ void test_multiple_small_ops(void)
 
         printf("Child received %d small messages\n", count);
         close(sv[1]);
-        exit(0);
+        fflush(stdout);
+        _exit(0);
     }
 
     /* Parent: send many small messages */
@@ -249,6 +315,7 @@ void test_multiple_small_ops(void)
 void test_readv_writev(void)
 {
     printf("\n=== Test 4: readv/writev via io_uring ===\n");
+    fflush(NULL);
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
@@ -278,6 +345,10 @@ void test_readv_writev(void)
             double throughput = (n / (1024.0 * 1024.0)) / (elapsed / 1000.0);
             printf("Child readv: %zd bytes in %.2f ms (%.2f MB/s)\n",
                    n, elapsed, throughput);
+        } else if (n < 0) {
+            perror("readv");
+        } else {
+            printf("Child readv returned 0 bytes\n");
         }
 
         for (int i = 0; i < IOV_COUNT; i++) {
@@ -285,7 +356,8 @@ void test_readv_writev(void)
         }
 
         close(sv[1]);
-        exit(0);
+        fflush(stdout);
+        _exit(0);
     }
 
     /* Parent: send using writev */
@@ -306,6 +378,10 @@ void test_readv_writev(void)
         double throughput = (n / (1024.0 * 1024.0)) / (elapsed / 1000.0);
         printf("Parent writev: %zd bytes in %.2f ms (%.2f MB/s)\n",
                n, elapsed, throughput);
+    } else if (n < 0) {
+        perror("writev");
+    } else {
+        printf("Parent writev returned 0 bytes\n");
     }
 
     for (int i = 0; i < IOV_COUNT; i++) {
@@ -318,6 +394,8 @@ void test_readv_writev(void)
 
 int main(void)
 {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     printf("========================================\n");
     printf("ClickHouse Zero-Copy Library v2 Test\n");
     printf("io_uring Edition\n");
